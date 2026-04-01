@@ -1,12 +1,16 @@
 "use client";
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
+import { createClient } from "@/lib/supabase/client";
 import { isPast, fmtDate, timeLeft, relTime } from "@/lib/formatters";
 
 export default function StudentDashboard() {
   const [user, setUser] = useState(null);
+  const [profile, setProfile] = useState(null);
   const [activeTab, setActiveTab] = useState("dashboard");
+  const [loading, setLoading] = useState(true);
   const router = useRouter();
+  const supabase = createClient();
 
   const [assignments, setAssignments] = useState([]);
   const [mySubmissions, setMySubmissions] = useState([]);
@@ -17,93 +21,213 @@ export default function StudentDashboard() {
   const [submitError, setSubmitError] = useState("");
   const fileInputRef = useRef(null);
 
+  // Multi-teacher chat state
+  const [teachers, setTeachers] = useState([]);
+  const [selectedTeacher, setSelectedTeacher] = useState(null);
   const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState("");
   const [chatSending, setChatSending] = useState(false);
+  const [allChatMessages, setAllChatMessages] = useState([]);
   const chatBottomRef = useRef(null);
 
+  // Check auth and load profile
   useEffect(() => {
-    const stored = sessionStorage.getItem("user");
-    if (!stored) { router.push("/"); return; }
-    const parsed = JSON.parse(stored);
-    if (parsed.role !== "student") { router.push("/"); return; }
-    setUser(parsed);
-  }, [router]);
+    async function checkAuth() {
+      const { data: { user: authUser } } = await supabase.auth.getUser();
+      if (!authUser) {
+        router.push("/");
+        return;
+      }
+      setUser(authUser);
 
+      // Load profile
+      const { data: profileData } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", authUser.id)
+        .single();
+
+      if (!profileData || profileData.role !== "student") {
+        router.push("/");
+        return;
+      }
+      setProfile(profileData);
+      setLoading(false);
+    }
+    checkAuth();
+  }, [router, supabase]);
+
+  // Load all @olula.edu.mn teachers
   useEffect(() => {
-    if (!user) return;
-    Promise.all([
-      fetch(`/api/assignments?studentTeacherGmail=${encodeURIComponent(user.teacherGmail)}&grade=${user.grade}`).then(r => r.json()),
-      fetch(`/api/submissions?studentGmail=${encodeURIComponent(user.gmail)}`).then(r => r.json()),
-    ]).then(([aData, sData]) => {
-      setAssignments(aData.assignments || []);
-      setMySubmissions(sData.submissions || []);
-    });
-  }, [user]);
+    if (!profile) return;
+    async function loadTeachers() {
+      const { data } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("role", "teacher")
+        .ilike("email", "%@olula.edu.mn");
+      setTeachers(data || []);
+    }
+    loadTeachers();
+  }, [profile, supabase]);
 
-  const loadChat = useCallback((gmail, teacherGmail) => {
-    fetch(`/api/chat?studentGmail=${encodeURIComponent(gmail)}&teacherGmail=${encodeURIComponent(teacherGmail)}`)
-      .then(r => r.json()).then(d => setChatMessages(d.messages || []));
-  }, []);
-
+  // Load assignments for student's grade
   useEffect(() => {
-    if (!user) return;
-    loadChat(user.gmail, user.teacherGmail);
-  }, [user, loadChat]);
+    if (!profile) return;
+    async function loadData() {
+      // Load assignments for student's grade
+      const { data: assignmentsData } = await supabase
+        .from("assignments")
+        .select("*, profiles!assignments_teacher_id_fkey(first_name, last_name, email)")
+        .eq("grade", profile.grade);
+      setAssignments(assignmentsData || []);
 
+      // Load student's submissions
+      const { data: subsData } = await supabase
+        .from("submissions")
+        .select("*")
+        .eq("student_id", profile.id);
+      setMySubmissions(subsData || []);
+    }
+    loadData();
+  }, [profile, supabase]);
+
+  // Load all chat messages for sidebar
   useEffect(() => {
-    if (!user || activeTab !== "chat") return;
-    const iv = setInterval(() => loadChat(user.gmail, user.teacherGmail), 5000);
+    if (!profile || activeTab !== "chat") return;
+    async function loadAllChats() {
+      const { data } = await supabase
+        .from("messages")
+        .select("*")
+        .or(`from_user_id.eq.${profile.id},to_user_id.eq.${profile.id}`)
+        .order("sent_at", { ascending: false });
+      setAllChatMessages(data || []);
+    }
+    loadAllChats();
+    const iv = setInterval(loadAllChats, 5000);
     return () => clearInterval(iv);
-  }, [user, activeTab, loadChat]);
+  }, [profile, activeTab, supabase]);
 
-  useEffect(() => { chatBottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatMessages]);
+  // Load chat messages with selected teacher
+  const loadChat = useCallback(async (teacherId) => {
+    if (!profile || !teacherId) return;
+    const { data } = await supabase
+      .from("messages")
+      .select("*")
+      .or(`and(from_user_id.eq.${profile.id},to_user_id.eq.${teacherId}),and(from_user_id.eq.${teacherId},to_user_id.eq.${profile.id})`)
+      .order("sent_at", { ascending: true });
+    setChatMessages(data || []);
+  }, [profile, supabase]);
 
-  function logout() { sessionStorage.removeItem("user"); router.push("/"); }
-  function getSubmission(aid) { return mySubmissions.find(s => s.assignmentId === aid) || null; }
-  function isUrgent(deadline) { const d = new Date(deadline) - new Date(); return d > 0 && d < 24 * 3600 * 1000; }
+  useEffect(() => {
+    if (!selectedTeacher) return;
+    loadChat(selectedTeacher.id);
+    const iv = setInterval(() => loadChat(selectedTeacher.id), 5000);
+    return () => clearInterval(iv);
+  }, [selectedTeacher, loadChat]);
+
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages]);
+
+  async function logout() {
+    await supabase.auth.signOut();
+    router.push("/");
+  }
+
+  function getSubmission(aid) {
+    return mySubmissions.find(s => s.assignment_id === aid) || null;
+  }
+
+  function isUrgent(deadline) {
+    const d = new Date(deadline) - new Date();
+    return d > 0 && d < 24 * 3600 * 1000;
+  }
 
   async function handleSubmit(e) {
     e.preventDefault();
-    if (!submitFile && !submitText.trim()) { setSubmitError("Зураг эсвэл тайлбар оруулна уу"); return; }
-    setSubmitting(true); setSubmitError("");
+    if (!submitFile && !submitText.trim()) {
+      setSubmitError("Зураг эсвэл тайлбар оруулна уу");
+      return;
+    }
+    setSubmitting(true);
+    setSubmitError("");
     try {
-      const fd = new FormData();
-      fd.append("assignmentId", submitTarget.id);
-      fd.append("studentGmail", user.gmail);
-      fd.append("text", submitText);
-      if (submitFile) fd.append("file", submitFile);
-      const res = await fetch("/api/submissions", { method: "POST", body: fd });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      setMySubmissions(prev => [...prev.filter(s => s.assignmentId !== submitTarget.id), data.submission]);
-      setSubmitTarget(null); setSubmitText(""); setSubmitFile(null);
-    } catch (err) { setSubmitError(err.message); }
-    finally { setSubmitting(false); }
+      let filePath = null;
+      if (submitFile) {
+        const fileExt = submitFile.name.split('.').pop();
+        const fileName = `${profile.id}/${submitTarget.id}/${Date.now()}.${fileExt}`;
+        const { error: uploadError } = await supabase.storage
+          .from("submissions")
+          .upload(fileName, submitFile);
+        if (uploadError) throw uploadError;
+        filePath = fileName;
+      }
+
+      const { data, error } = await supabase
+        .from("submissions")
+        .upsert({
+          assignment_id: submitTarget.id,
+          student_id: profile.id,
+          text: submitText,
+          file_path: filePath,
+          submitted_at: new Date().toISOString(),
+        }, { onConflict: "assignment_id,student_id" })
+        .select()
+        .single();
+
+      if (error) throw error;
+      setMySubmissions(prev => [...prev.filter(s => s.assignment_id !== submitTarget.id), data]);
+      setSubmitTarget(null);
+      setSubmitText("");
+      setSubmitFile(null);
+    } catch (err) {
+      setSubmitError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   async function handleSendChat(e) {
     e.preventDefault();
-    if (!chatInput.trim()) return;
+    if (!chatInput.trim() || !selectedTeacher) return;
     setChatSending(true);
     try {
-      const res = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fromGmail: user.gmail, toGmail: user.teacherGmail, text: chatInput }) });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      setChatMessages(prev => [...prev, data.message]);
+      const { data, error } = await supabase
+        .from("messages")
+        .insert({
+          from_user_id: profile.id,
+          to_user_id: selectedTeacher.id,
+          text: chatInput,
+        })
+        .select()
+        .single();
+      if (error) throw error;
+      setChatMessages(prev => [...prev, data]);
       setChatInput("");
-    } finally { setChatSending(false); }
+    } finally {
+      setChatSending(false);
+    }
   }
 
-  if (!user) return null;
+  if (loading || !profile) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", background: "#f8fafc" }}>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ width: 40, height: 40, border: "3px solid #06b6d4", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 1s linear infinite", margin: "0 auto 16px" }} />
+          <p style={{ color: "#6b7280" }}>Ачаалж байна...</p>
+        </div>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      </div>
+    );
+  }
 
-  const displayName = user.lastName && user.firstName
-    ? `${user.lastName} ${user.firstName}`
-    : user.gmail.split("@")[0];
-  const initials = user.lastName && user.firstName
-    ? (user.lastName[0] + user.firstName[0]).toUpperCase()
-    : user.gmail[0].toUpperCase();
+  const displayName = profile.last_name && profile.first_name
+    ? `${profile.last_name} ${profile.first_name}`
+    : profile.email.split("@")[0];
+  const initials = profile.last_name && profile.first_name
+    ? (profile.last_name[0] + profile.first_name[0]).toUpperCase()
+    : profile.email[0].toUpperCase();
 
   const activeAssignments = assignments.filter(a => !isPast(a.deadline));
   const pastAssignments = assignments.filter(a => isPast(a.deadline));
@@ -113,18 +237,27 @@ export default function StudentDashboard() {
     ? Math.round(gradedSubs.reduce((s, sub) => s + sub.score, 0) / gradedSubs.length)
     : null;
 
-  const unreadChat = (() => {
-    if (!chatMessages.length) return false;
-    const sorted = [...chatMessages].sort((a, b) => new Date(a.sentAt) - new Date(b.sentAt));
-    return sorted[sorted.length - 1].fromGmail === user.teacherGmail;
-  })();
+  // Get teachers with conversations
+  const teachersWithChats = teachers.filter(t => 
+    allChatMessages.some(m => m.from_user_id === t.id || m.to_user_id === t.id)
+  );
+
+  // Count unread messages (last message from teacher)
+  const getUnreadCount = (teacherId) => {
+    const convo = allChatMessages
+      .filter(m => m.from_user_id === teacherId || m.to_user_id === teacherId)
+      .sort((a, b) => new Date(b.sent_at) - new Date(a.sent_at));
+    return convo.length > 0 && convo[0].from_user_id === teacherId ? 1 : 0;
+  };
+
+  const totalUnread = teachers.reduce((sum, t) => sum + getUnreadCount(t.id), 0);
 
   const NAV = [
     { key: "dashboard", label: "Хяналтын самбар", badge: null,
       icon: <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg> },
     { key: "assignments", label: "Миний даалгавар", badge: pendingCount || null,
       icon: <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm-1 7V3.5L18.5 9H13z"/></svg> },
-    { key: "chat", label: "Мессеж", badge: unreadChat ? 1 : null,
+    { key: "chat", label: "Багш нартай чат", badge: totalUnread || null,
       icon: <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg> },
   ];
 
@@ -144,18 +277,16 @@ export default function StudentDashboard() {
 
       {/* SIDEBAR */}
       <div style={S.sidebar}>
-        {/* Header */}
         <div style={{ padding: "22px 14px 14px", display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 40, height: 40, borderRadius: 12, background: "rgba(255,255,255,0.25)", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontWeight: 800, fontSize: 16, flexShrink: 0 }}>
             {initials}
           </div>
           <div style={{ minWidth: 0 }}>
             <p style={{ color: "white", fontWeight: 700, fontSize: 13, margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>Сурагчийн самбар</p>
-            <p style={{ color: "rgba(255,255,255,0.65)", fontSize: 11, margin: 0 }}>Сурагч</p>
+            <p style={{ color: "rgba(255,255,255,0.65)", fontSize: 11, margin: 0 }}>{profile.grade}-р анги</p>
           </div>
         </div>
 
-        {/* Nav */}
         <nav style={{ flex: 1, padding: "6px 10px", display: "flex", flexDirection: "column", gap: 3 }}>
           {NAV.map(item => {
             const active = activeTab === item.key;
@@ -175,7 +306,6 @@ export default function StudentDashboard() {
           })}
         </nav>
 
-        {/* Bottom user card */}
         <div style={{ margin: "0 10px 16px", padding: "10px 12px", borderRadius: 10, background: "rgba(255,255,255,0.15)", display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 32, height: 32, borderRadius: 8, background: "rgba(255,255,255,0.3)", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontWeight: 800, fontSize: 12, flexShrink: 0 }}>
             {initials}
@@ -205,34 +335,25 @@ export default function StudentDashboard() {
               <p style={{ margin: 0, fontSize: 13, color: "#9ca3af" }}>{assignments.length} даалгавар нийт</p>
             </>}
             {activeTab === "chat" && <>
-              <h1 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: "#111827" }}>Мессеж</h1>
-              <p style={{ margin: 0, fontSize: 13, color: "#9ca3af" }}>{user.teacherName || user.teacherGmail}</p>
+              <h1 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: "#111827" }}>Багш нартай чат</h1>
+              <p style={{ margin: 0, fontSize: 13, color: "#9ca3af" }}>{teachers.length} багш @olula.edu.mn</p>
             </>}
           </div>
-          {unreadChat && (
-            <button onClick={() => setActiveTab("chat")}
-              style={{ position: "relative", width: 38, height: 38, borderRadius: 10, background: "#f1f5f9", border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "#6b7280" }}>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>
-              <span style={{ position: "absolute", top: -3, right: -3, width: 16, height: 16, background: "#ef4444", borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontSize: 9, fontWeight: 800 }}>!</span>
-            </button>
-          )}
         </div>
 
         {/* Content */}
         <div style={{ flex: 1, overflow: "hidden" }}>
 
-          {/* ── DASHBOARD ── */}
+          {/* DASHBOARD */}
           {activeTab === "dashboard" && (
             <div style={{ height: "100%", overflowY: "auto", padding: "24px 28px" }}>
-
-              {/* Stats row */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 16, marginBottom: 24 }}>
                 {[
-                  { label: "Элссэн хичээл", value: assignments.length, bg: "#e0f7fa",
+                  { label: "Нийт даалгавар", value: assignments.length, bg: "#e0f7fa",
                     icon: <svg width="22" height="22" viewBox="0 0 24 24" fill="#06b6d4"><path d="M21 5c-1.11-.35-2.33-.5-3.5-.5-1.95 0-4.05.4-5.5 1.5-1.45-1.1-3.55-1.5-5.5-1.5S2.45 4.9 1 6v14.65c0 .25.25.5.5.5.1 0 .15-.05.25-.05C3.1 20.45 5.05 20 6.5 20c1.95 0 4.05.4 5.5 1.5 1.35-.85 3.8-1.5 5.5-1.5 1.65 0 3.35.3 4.75 1.05.1.05.15.05.25.05.25 0 .5-.25.5-.5V6c-.6-.45-1.25-.75-2-1z"/></svg> },
                   { label: "Хүлээгдэж буй", value: pendingCount, bg: "#fff3e0",
                     icon: <svg width="22" height="22" viewBox="0 0 24 24" fill="#f97316"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg> },
-                  { label: "Дууссан", value: mySubmissions.length, bg: "#e8fdf5",
+                  { label: "Илгээсэн", value: mySubmissions.length, bg: "#e8fdf5",
                     icon: <svg width="22" height="22" viewBox="0 0 24 24" fill="#10b981"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg> },
                   { label: "Дундаж үнэлгээ", value: avgScore !== null ? `${avgScore}%` : "—", bg: "#fff3e0",
                     icon: <svg width="22" height="22" viewBox="0 0 24 24" fill="#f97316"><path d="M16 6l2.29 2.29-4.88 4.88-4-4L2 16.59 3.41 18l6-6 4 4 6.3-6.29L22 12V6z"/></svg> },
@@ -247,19 +368,14 @@ export default function StudentDashboard() {
                 ))}
               </div>
 
-              {/* Two columns */}
               <div style={{ display: "grid", gridTemplateColumns: "1fr 300px", gap: 20 }}>
-
-                {/* Left column */}
                 <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-
-                  {/* Upcoming assignments */}
                   <div style={S.card}>
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
                       <p style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "#111827" }}>Удахгүй болох даалгавар</p>
                       <button onClick={() => setActiveTab("assignments")}
                         style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: "#06b6d4", fontWeight: 600 }}>
-                        Бүгдийг үзэх →
+                        Бүгдийг үзэх
                       </button>
                     </div>
                     {activeAssignments.length === 0 ? (
@@ -269,6 +385,7 @@ export default function StudentDashboard() {
                         {activeAssignments.slice(0, 4).map(a => {
                           const sub = getSubmission(a.id);
                           const urgent = isUrgent(a.deadline);
+                          const teacherName = a.profiles ? `${a.profiles.last_name || ""} ${a.profiles.first_name || ""}`.trim() || a.profiles.email : "Багш";
                           return (
                             <div key={a.id} style={{ borderLeft: "3px solid #06b6d4", paddingLeft: 14, paddingRight: 14, paddingTop: 10, paddingBottom: 10, borderRadius: "0 10px 10px 0", background: "#f8fafc", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
                               <div style={{ flex: 1, minWidth: 0 }}>
@@ -276,15 +393,16 @@ export default function StudentDashboard() {
                                   <p style={{ margin: 0, fontWeight: 700, fontSize: 14, color: "#111827", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.title}</p>
                                   {urgent && !sub && <span style={{ background: "#f97316", color: "white", fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 99, flexShrink: 0 }}>Яаралтай</span>}
                                 </div>
-                                <div style={{ display: "flex", alignItems: "center", gap: 5, color: "#9ca3af", fontSize: 12 }}>
-                                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M17 12h-5v5h5v-5zM16 1v2H8V1H6v2H5c-1.11 0-1.99.9-1.99 2L3 19c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2h-1V1h-2zm3 18H5V8h14v11z"/></svg>
+                                <div style={{ display: "flex", alignItems: "center", gap: 10, color: "#9ca3af", fontSize: 12 }}>
+                                  <span>{teacherName}</span>
+                                  <span>•</span>
                                   <span>{fmtDate(a.deadline)}</span>
                                 </div>
                               </div>
                               <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
                                 <span style={{ fontSize: 13, fontWeight: 600, color: "#6b7280" }}>{a.points} оноо</span>
                                 {sub ? (
-                                  <span style={{ background: "#dcfce7", color: "#16a34a", fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 99 }}>✓</span>
+                                  <span style={{ background: "#dcfce7", color: "#16a34a", fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 99 }}>Илгээсэн</span>
                                 ) : (
                                   <button onClick={() => { setSubmitTarget(a); setSubmitText(""); setSubmitFile(null); setSubmitError(""); }}
                                     style={{ background: "#06b6d4", color: "white", border: "none", cursor: "pointer", fontSize: 12, fontWeight: 700, padding: "6px 14px", borderRadius: 8 }}>
@@ -299,19 +417,18 @@ export default function StudentDashboard() {
                     )}
                   </div>
 
-                  {/* Recent grades */}
                   {gradedSubs.length > 0 && (
                     <div style={S.card}>
                       <p style={{ margin: "0 0 14px", fontWeight: 700, fontSize: 15, color: "#111827" }}>Сүүлийн үнэлгээ</p>
                       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                        {[...gradedSubs].sort((a, b) => new Date(b.gradedAt) - new Date(a.gradedAt)).slice(0, 3).map(sub => {
-                          const asgn = assignments.find(a => a.id === sub.assignmentId);
+                        {[...gradedSubs].sort((a, b) => new Date(b.graded_at) - new Date(a.graded_at)).slice(0, 3).map(sub => {
+                          const asgn = assignments.find(a => a.id === sub.assignment_id);
                           const scoreColor = sub.score >= 80 ? "#10b981" : sub.score >= 50 ? "#f97316" : "#ef4444";
                           return (
                             <div key={sub.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", background: "#f8fafc", borderRadius: 10 }}>
                               <div>
                                 <p style={{ margin: 0, fontWeight: 600, fontSize: 14, color: "#111827" }}>{asgn?.title || "Даалгавар"}</p>
-                                <p style={{ margin: 0, fontSize: 12, color: "#9ca3af" }}>{relTime(sub.gradedAt)}</p>
+                                <p style={{ margin: 0, fontSize: 12, color: "#9ca3af" }}>{relTime(sub.graded_at)}</p>
                               </div>
                               <span style={{ fontSize: 22, fontWeight: 900, color: scoreColor }}>{sub.score}%</span>
                             </div>
@@ -322,74 +439,33 @@ export default function StudentDashboard() {
                   )}
                 </div>
 
-                {/* Right column */}
                 <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-
-                  {/* Progress bars */}
                   <div style={S.card}>
-                    <p style={{ margin: "0 0 16px", fontWeight: 700, fontSize: 15, color: "#111827" }}>Хичээлийн явц</p>
-                    {gradedSubs.length === 0 ? (
-                      <p style={{ textAlign: "center", color: "#d1d5db", fontSize: 13, padding: "10px 0", margin: 0 }}>Үнэлгээ байхгүй</p>
+                    <p style={{ margin: "0 0 14px", fontWeight: 700, fontSize: 15, color: "#111827" }}>Багш нар</p>
+                    {teachers.length === 0 ? (
+                      <p style={{ textAlign: "center", color: "#d1d5db", fontSize: 13, padding: "20px 0", margin: 0 }}>Багш олдсонгүй</p>
                     ) : (
-                      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-                        {[...gradedSubs].slice(0, 4).map(sub => {
-                          const asgn = assignments.find(a => a.id === sub.assignmentId);
-                          const bar = sub.score >= 80 ? "#06b6d4" : sub.score >= 50 ? "#f97316" : "#ef4444";
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        {teachers.slice(0, 5).map(t => {
+                          const name = t.last_name && t.first_name ? `${t.last_name[0]}.${t.first_name}` : t.email.split("@")[0];
+                          const init = t.last_name && t.first_name ? (t.last_name[0] + t.first_name[0]).toUpperCase() : t.email[0].toUpperCase();
                           return (
-                            <div key={sub.id}>
-                              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
-                                <span style={{ fontSize: 13, fontWeight: 600, color: "#374151", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "75%" }}>{asgn?.title || "Даалгавар"}</span>
-                                <span style={{ fontSize: 13, fontWeight: 700, color: "#111827" }}>{sub.score}%</span>
+                            <div key={t.id} onClick={() => { setSelectedTeacher(t); setActiveTab("chat"); }}
+                              style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 10, background: "#f8fafc", cursor: "pointer" }}>
+                              <div style={{ width: 32, height: 32, borderRadius: 8, background: "#06b6d4", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontWeight: 700, fontSize: 11 }}>{init}</div>
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <p style={{ margin: 0, fontWeight: 600, fontSize: 13, color: "#111827" }}>{name}</p>
+                                <p style={{ margin: 0, fontSize: 11, color: "#9ca3af" }}>{t.email}</p>
                               </div>
-                              <div style={{ height: 6, borderRadius: 99, background: "#f1f5f9", overflow: "hidden" }}>
-                                <div style={{ height: "100%", borderRadius: 99, width: `${sub.score}%`, background: bar }} />
-                              </div>
+                              <svg width="16" height="16" viewBox="0 0 24 24" fill="#9ca3af"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>
                             </div>
                           );
                         })}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Tips */}
-                  <div style={{ borderRadius: 16, padding: "20px", background: "linear-gradient(135deg,#06b6d4,#0891b2)" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-                      <svg width="16" height="16" viewBox="0 0 24 24" fill="rgba(255,255,255,0.8)"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
-                      <p style={{ margin: 0, color: "white", fontWeight: 700, fontSize: 14 }}>Зөвлөмж</p>
-                    </div>
-                    <ul style={{ margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 8 }}>
-                      {["Даалгаврыг хугацаанаас өмнө илгээх","Материалыг сайтар уншаад бодох","Асуул байвал багшаас асуух","Өдөр бүр идэвхтэй оролцох"].map((tip, i) => (
-                        <li key={i} style={{ fontSize: 12, color: "rgba(255,255,255,0.9)", display: "flex", gap: 8, lineHeight: 1.4 }}>
-                          <span style={{ color: "rgba(255,255,255,0.5)", flexShrink: 0 }}>•</span>{tip}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-
-                  {/* Chat preview */}
-                  <div style={S.card}>
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                      <p style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "#111827" }}>Багш</p>
-                      <button onClick={() => setActiveTab("chat")}
-                        style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: "#06b6d4", fontWeight: 600 }}>
-                        Нээх →
-                      </button>
-                    </div>
-                    {chatMessages.length === 0 ? (
-                      <p style={{ fontSize: 12, color: "#d1d5db", textAlign: "center", padding: "8px 0", margin: 0 }}>Мессеж байхгүй</p>
-                    ) : (
-                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                        {[...chatMessages].sort((a, b) => new Date(a.sentAt) - new Date(b.sentAt)).slice(-2).map(msg => {
-                          const isMe = msg.fromGmail === user.gmail;
-                          return (
-                            <div key={msg.id} style={{ display: "flex", justifyContent: isMe ? "flex-end" : "flex-start" }}>
-                              <div style={{ maxWidth: "80%", padding: "6px 12px", borderRadius: 12, fontSize: 12,
-                                background: isMe ? "#06b6d4" : "#f3f4f6", color: isMe ? "white" : "#111827" }}>
-                                {msg.text}
-                              </div>
-                            </div>
-                          );
-                        })}
+                        {teachers.length > 5 && (
+                          <button onClick={() => setActiveTab("chat")} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 13, color: "#06b6d4", fontWeight: 600, padding: "8px 0" }}>
+                            +{teachers.length - 5} бусад багш
+                          </button>
+                        )}
                       </div>
                     )}
                   </div>
@@ -398,197 +474,257 @@ export default function StudentDashboard() {
             </div>
           )}
 
-          {/* ── ASSIGNMENTS ── */}
+          {/* ASSIGNMENTS */}
           {activeTab === "assignments" && (
             <div style={{ height: "100%", overflowY: "auto", padding: "24px 28px" }}>
-              {assignments.length === 0 ? (
-                <div style={{ ...S.card, textAlign: "center", padding: "48px 20px" }}>
-                  <svg style={{ display: "block", margin: "0 auto 12px" }} width="40" height="40" viewBox="0 0 24 24" fill="#d1d5db"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6z"/></svg>
-                  <p style={{ color: "#9ca3af", margin: 0 }}>Одоохондоо даалгавар байхгүй</p>
+              <div style={S.card}>
+                <p style={{ margin: "0 0 16px", fontWeight: 700, fontSize: 15, color: "#111827" }}>Идэвхтэй даалгаврууд ({activeAssignments.length})</p>
+                {activeAssignments.length === 0 ? (
+                  <p style={{ textAlign: "center", color: "#d1d5db", fontSize: 13, padding: "30px 0", margin: 0 }}>Идэвхтэй даалгавар байхгүй</p>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {activeAssignments.map(a => {
+                      const sub = getSubmission(a.id);
+                      const urgent = isUrgent(a.deadline);
+                      const teacherName = a.profiles ? `${a.profiles.last_name || ""} ${a.profiles.first_name || ""}`.trim() || a.profiles.email : "Багш";
+                      return (
+                        <div key={a.id} style={{ borderLeft: "3px solid #06b6d4", paddingLeft: 14, paddingRight: 14, paddingTop: 12, paddingBottom: 12, borderRadius: "0 10px 10px 0", background: "#f8fafc", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                              <p style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "#111827" }}>{a.title}</p>
+                              {urgent && !sub && <span style={{ background: "#f97316", color: "white", fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 99 }}>Яаралтай</span>}
+                            </div>
+                            {a.description && <p style={{ margin: "0 0 6px", fontSize: 13, color: "#6b7280" }}>{a.description}</p>}
+                            <div style={{ display: "flex", alignItems: "center", gap: 12, color: "#9ca3af", fontSize: 12 }}>
+                              <span>{teacherName}</span>
+                              <span>•</span>
+                              <span>Хугацаа: {fmtDate(a.deadline)}</span>
+                              <span>•</span>
+                              <span>{a.points} оноо</span>
+                            </div>
+                          </div>
+                          {sub ? (
+                            <div style={{ textAlign: "right" }}>
+                              <span style={{ background: "#dcfce7", color: "#16a34a", fontSize: 12, fontWeight: 700, padding: "6px 14px", borderRadius: 99 }}>Илгээсэн</span>
+                              {sub.score !== null && <p style={{ margin: "6px 0 0", fontSize: 20, fontWeight: 900, color: sub.score >= 80 ? "#10b981" : sub.score >= 50 ? "#f97316" : "#ef4444" }}>{sub.score}%</p>}
+                            </div>
+                          ) : (
+                            <button onClick={() => { setSubmitTarget(a); setSubmitText(""); setSubmitFile(null); setSubmitError(""); }}
+                              style={{ background: "#06b6d4", color: "white", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 700, padding: "10px 20px", borderRadius: 10 }}>
+                              Илгээх
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {pastAssignments.length > 0 && (
+                <div style={{ ...S.card, marginTop: 20 }}>
+                  <p style={{ margin: "0 0 16px", fontWeight: 700, fontSize: 15, color: "#111827" }}>Дууссан даалгаврууд ({pastAssignments.length})</p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {pastAssignments.map(a => {
+                      const sub = getSubmission(a.id);
+                      const teacherName = a.profiles ? `${a.profiles.last_name || ""} ${a.profiles.first_name || ""}`.trim() || a.profiles.email : "Багш";
+                      return (
+                        <div key={a.id} style={{ paddingLeft: 14, paddingRight: 14, paddingTop: 12, paddingBottom: 12, borderRadius: 10, background: "#f8fafc", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, opacity: 0.7 }}>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <p style={{ margin: 0, fontWeight: 700, fontSize: 14, color: "#111827" }}>{a.title}</p>
+                            <div style={{ display: "flex", alignItems: "center", gap: 12, color: "#9ca3af", fontSize: 12, marginTop: 4 }}>
+                              <span>{teacherName}</span>
+                              <span>•</span>
+                              <span>Дууссан: {fmtDate(a.deadline)}</span>
+                            </div>
+                          </div>
+                          {sub ? (
+                            <span style={{ fontSize: 18, fontWeight: 900, color: sub.score !== null ? (sub.score >= 80 ? "#10b981" : sub.score >= 50 ? "#f97316" : "#ef4444") : "#9ca3af" }}>
+                              {sub.score !== null ? `${sub.score}%` : "Хүлээгдэж буй"}
+                            </span>
+                          ) : (
+                            <span style={{ color: "#ef4444", fontSize: 12, fontWeight: 600 }}>Илгээгээгүй</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
-              ) : (
-                <>
-                  {activeAssignments.length > 0 && (
-                    <div style={{ marginBottom: 24 }}>
-                      <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 1 }}>Идэвхтэй</p>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                        {activeAssignments.map(a => {
-                          const sub = getSubmission(a.id);
-                          const tl = timeLeft(a.deadline);
-                          const urgent = isUrgent(a.deadline);
-                          return (
-                            <div key={a.id} style={{ ...S.card, borderLeft: "4px solid #06b6d4", borderRadius: "0 14px 14px 0", padding: "16px 20px" }}>
-                              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
-                                <div style={{ flex: 1, minWidth: 0 }}>
-                                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                                    <p style={{ margin: 0, fontWeight: 700, fontSize: 16, color: "#111827" }}>{a.title}</p>
-                                    {urgent && !sub && <span style={{ background: "#f97316", color: "white", fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 99 }}>Яаралтай</span>}
-                                  </div>
-                                  {a.description && <p style={{ margin: "4px 0 0", fontSize: 13, color: "#6b7280" }}>{a.description}</p>}
-                                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6, fontSize: 12, color: "#9ca3af" }}>
-                                    <span>Хугацаа: {fmtDate(a.deadline)}</span>
-                                    <span>•</span>
-                                    <span>{a.points} оноо</span>
-                                    {tl && <><span>•</span><span style={{ color: "#06b6d4", fontWeight: 600 }}>{tl}</span></>}
-                                  </div>
-                                </div>
-                                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6, flexShrink: 0 }}>
-                                  {sub ? (
-                                    <>
-                                      {sub.score !== null
-                                        ? <span style={{ fontSize: 24, fontWeight: 900, color: "#06b6d4" }}>{sub.score}%</span>
-                                        : <span style={{ background: "#dcfce7", color: "#16a34a", fontSize: 12, fontWeight: 700, padding: "4px 12px", borderRadius: 99 }}>✓ Илгээсэн</span>}
-                                      <button onClick={() => { setSubmitTarget(a); setSubmitText(sub.text || ""); setSubmitFile(null); setSubmitError(""); }}
-                                        style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: "#9ca3af", textDecoration: "underline" }}>
-                                        Дахин илгээх
-                                      </button>
-                                    </>
-                                  ) : (
-                                    <button onClick={() => { setSubmitTarget(a); setSubmitText(""); setSubmitFile(null); setSubmitError(""); }}
-                                      style={{ background: "#06b6d4", color: "white", border: "none", cursor: "pointer", fontWeight: 700, fontSize: 13, padding: "8px 18px", borderRadius: 10 }}>
-                                      Илгээх
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-                  {pastAssignments.length > 0 && (
-                    <div>
-                      <p style={{ margin: "0 0 12px", fontSize: 12, fontWeight: 700, color: "#9ca3af", textTransform: "uppercase", letterSpacing: 1 }}>Хугацаа дууссан</p>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                        {pastAssignments.map(a => {
-                          const sub = getSubmission(a.id);
-                          return (
-                            <div key={a.id} style={{ ...S.card, borderLeft: "4px solid #e5e7eb", borderRadius: "0 14px 14px 0", padding: "16px 20px", opacity: 0.7 }}>
-                              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-                                <div>
-                                  <p style={{ margin: 0, fontWeight: 700, fontSize: 15, color: "#374151" }}>{a.title}</p>
-                                  <div style={{ display: "flex", gap: 10, marginTop: 4, fontSize: 12, color: "#9ca3af" }}>
-                                    <span>Дууссан: {fmtDate(a.deadline)}</span>
-                                    <span>•</span>
-                                    <span>{a.points} оноо</span>
-                                  </div>
-                                </div>
-                                {sub ? (
-                                  sub.score !== null
-                                    ? <span style={{ fontSize: 22, fontWeight: 900, color: "#06b6d4" }}>{sub.score}%</span>
-                                    : <span style={{ background: "#dcfce7", color: "#16a34a", fontSize: 12, fontWeight: 700, padding: "4px 12px", borderRadius: 99 }}>✓ Илгээсэн</span>
-                                ) : (
-                                  <span style={{ background: "#fee2e2", color: "#ef4444", fontSize: 12, fontWeight: 700, padding: "4px 12px", borderRadius: 99 }}>Илгээгээгүй</span>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-                </>
               )}
             </div>
           )}
 
-          {/* ── CHAT ── */}
+          {/* MULTI-TEACHER CHAT */}
           {activeTab === "chat" && (
-            <div style={{ height: "100%", display: "flex", flexDirection: "column", maxWidth: 680, margin: "0 auto", width: "100%" }}>
-              <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px", display: "flex", flexDirection: "column", gap: 10 }}>
-                {chatMessages.length === 0 && (
-                  <p style={{ textAlign: "center", color: "#d1d5db", fontSize: 13, marginTop: 48 }}>Мессеж байхгүй. Эхний мессежийг илгээнэ үү.</p>
-                )}
-                {[...chatMessages].sort((a, b) => new Date(a.sentAt) - new Date(b.sentAt)).map(msg => {
-                  const isMe = msg.fromGmail === user.gmail;
-                  return (
-                    <div key={msg.id} style={{ display: "flex", justifyContent: isMe ? "flex-end" : "flex-start" }}>
-                      <div style={{ maxWidth: 320, padding: "10px 14px", borderRadius: 18, fontSize: 14,
-                        borderBottomRightRadius: isMe ? 4 : 18, borderBottomLeftRadius: isMe ? 18 : 4,
-                        background: isMe ? "#06b6d4" : "white", color: isMe ? "white" : "#111827",
-                        boxShadow: "0 1px 3px rgba(0,0,0,0.08)" }}>
-                        <p style={{ margin: 0 }}>{msg.text}</p>
-                        <p style={{ margin: "4px 0 0", fontSize: 11, opacity: 0.6 }}>{relTime(msg.sentAt)}</p>
+            <div style={{ display: "flex", height: "100%", overflow: "hidden" }}>
+              {/* Teacher list sidebar */}
+              <div style={{ width: 280, borderRight: "1px solid #f1f5f9", display: "flex", flexDirection: "column", background: "white" }}>
+                <div style={{ padding: "16px", borderBottom: "1px solid #f1f5f9" }}>
+                  <p style={{ margin: 0, fontWeight: 700, fontSize: 14, color: "#111827" }}>Бүх @olula.edu.mn багш нар</p>
+                  <p style={{ margin: "4px 0 0", fontSize: 12, color: "#9ca3af" }}>{teachers.length} багш</p>
+                </div>
+                <div style={{ flex: 1, overflowY: "auto", padding: "8px" }}>
+                  {teachers.map(t => {
+                    const name = t.last_name && t.first_name ? `${t.last_name[0]}.${t.first_name}` : t.email.split("@")[0];
+                    const init = t.last_name && t.first_name ? (t.last_name[0] + t.first_name[0]).toUpperCase() : t.email[0].toUpperCase();
+                    const isSelected = selectedTeacher?.id === t.id;
+                    const unread = getUnreadCount(t.id);
+                    const lastMsg = allChatMessages
+                      .filter(m => m.from_user_id === t.id || m.to_user_id === t.id)
+                      .sort((a, b) => new Date(b.sent_at) - new Date(a.sent_at))[0];
+                    return (
+                      <div key={t.id} onClick={() => setSelectedTeacher(t)}
+                        style={{
+                          display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 10, cursor: "pointer", marginBottom: 4,
+                          background: isSelected ? "#e0f7fa" : "transparent",
+                        }}>
+                        <div style={{ width: 40, height: 40, borderRadius: 10, background: "#06b6d4", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontWeight: 700, fontSize: 13, flexShrink: 0 }}>{init}</div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                            <p style={{ margin: 0, fontWeight: 600, fontSize: 13, color: "#111827" }}>{name}</p>
+                            {unread > 0 && <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#06b6d4" }} />}
+                          </div>
+                          <p style={{ margin: "2px 0 0", fontSize: 11, color: "#9ca3af", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {lastMsg ? lastMsg.text.substring(0, 30) + (lastMsg.text.length > 30 ? "..." : "") : t.email}
+                          </p>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Chat area */}
+              <div style={{ flex: 1, display: "flex", flexDirection: "column", background: "#f8fafc" }}>
+                {!selectedTeacher ? (
+                  <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <div style={{ textAlign: "center", color: "#9ca3af" }}>
+                      <svg width="48" height="48" viewBox="0 0 24 24" fill="currentColor" style={{ margin: "0 auto 12px", opacity: 0.5 }}><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>
+                      <p style={{ margin: 0, fontSize: 14 }}>Багш сонгоод чат эхлүүлээрэй</p>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    {/* Chat header */}
+                    <div style={{ padding: "14px 20px", background: "white", borderBottom: "1px solid #f1f5f9", display: "flex", alignItems: "center", gap: 12 }}>
+                      <div style={{ width: 40, height: 40, borderRadius: 10, background: "#06b6d4", display: "flex", alignItems: "center", justifyContent: "center", color: "white", fontWeight: 700, fontSize: 14 }}>
+                        {selectedTeacher.last_name && selectedTeacher.first_name
+                          ? (selectedTeacher.last_name[0] + selectedTeacher.first_name[0]).toUpperCase()
+                          : selectedTeacher.email[0].toUpperCase()}
+                      </div>
+                      <div>
+                        <p style={{ margin: 0, fontWeight: 700, fontSize: 14, color: "#111827" }}>
+                          {selectedTeacher.last_name && selectedTeacher.first_name
+                            ? `${selectedTeacher.last_name} ${selectedTeacher.first_name}`
+                            : selectedTeacher.email.split("@")[0]}
+                        </p>
+                        <p style={{ margin: 0, fontSize: 12, color: "#9ca3af" }}>{selectedTeacher.email}</p>
                       </div>
                     </div>
-                  );
-                })}
-                <div ref={chatBottomRef} />
+
+                    {/* Messages */}
+                    <div style={{ flex: 1, overflowY: "auto", padding: "20px" }}>
+                      {chatMessages.length === 0 ? (
+                        <div style={{ textAlign: "center", color: "#9ca3af", padding: "40px 0" }}>
+                          <p style={{ margin: 0, fontSize: 13 }}>Одоохондоо мессеж байхгүй. Эхлээд бичээрэй!</p>
+                        </div>
+                      ) : (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                          {chatMessages.map(m => {
+                            const isMe = m.from_user_id === profile.id;
+                            return (
+                              <div key={m.id} style={{ display: "flex", justifyContent: isMe ? "flex-end" : "flex-start" }}>
+                                <div style={{
+                                  maxWidth: "70%",
+                                  padding: "10px 14px",
+                                  borderRadius: isMe ? "14px 14px 4px 14px" : "14px 14px 14px 4px",
+                                  background: isMe ? "#06b6d4" : "white",
+                                  color: isMe ? "white" : "#111827",
+                                  boxShadow: isMe ? "none" : "0 1px 4px rgba(0,0,0,0.06)",
+                                }}>
+                                  <p style={{ margin: 0, fontSize: 14, lineHeight: 1.5 }}>{m.text}</p>
+                                  <p style={{ margin: "6px 0 0", fontSize: 10, opacity: 0.7, textAlign: "right" }}>
+                                    {relTime(m.sent_at)}
+                                  </p>
+                                </div>
+                              </div>
+                            );
+                          })}
+                          <div ref={chatBottomRef} />
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Input */}
+                    <form onSubmit={handleSendChat} style={{ padding: "14px 20px", background: "white", borderTop: "1px solid #f1f5f9", display: "flex", gap: 12 }}>
+                      <input
+                        type="text"
+                        value={chatInput}
+                        onChange={e => setChatInput(e.target.value)}
+                        placeholder="Мессеж бичих..."
+                        style={{ flex: 1, padding: "12px 16px", borderRadius: 10, border: "1px solid #e5e7eb", fontSize: 14, outline: "none" }}
+                      />
+                      <button
+                        type="submit"
+                        disabled={chatSending || !chatInput.trim()}
+                        style={{
+                          padding: "12px 24px", borderRadius: 10, border: "none", cursor: "pointer",
+                          background: chatSending || !chatInput.trim() ? "#d1d5db" : "#06b6d4",
+                          color: "white", fontWeight: 700, fontSize: 14,
+                        }}>
+                        {chatSending ? "..." : "Илгээх"}
+                      </button>
+                    </form>
+                  </>
+                )}
               </div>
-              <form onSubmit={handleSendChat} style={{ padding: "14px 24px", borderTop: "1px solid #f1f5f9", display: "flex", gap: 10, background: "white", flexShrink: 0 }}>
-                <input type="text" placeholder="Мессеж бичих..." value={chatInput}
-                  onChange={e => setChatInput(e.target.value)}
-                  style={{ flex: 1, padding: "10px 16px", borderRadius: 12, border: "1px solid #e5e7eb", fontSize: 14, outline: "none", color: "#111827", background: "#f9fafb" }} />
-                <button type="submit" disabled={chatSending || !chatInput.trim()}
-                  style={{ background: "#06b6d4", color: "white", border: "none", cursor: "pointer", fontWeight: 700, fontSize: 14, padding: "10px 20px", borderRadius: 12, opacity: (chatSending || !chatInput.trim()) ? 0.5 : 1 }}>
-                  Илгээх
-                </button>
-              </form>
             </div>
           )}
-
         </div>
       </div>
 
-      {/* SUBMIT MODAL */}
+      {/* Submit modal */}
       {submitTarget && (
-        <div style={{ position: "fixed", inset: 0, zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 16, background: "rgba(0,0,0,0.4)" }}>
-          <div style={{ background: "white", borderRadius: 24, width: "100%", maxWidth: 480, padding: 32, boxShadow: "0 20px 60px rgba(0,0,0,0.2)" }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-              <h3 style={{ margin: 0, fontSize: 18, fontWeight: 800, color: "#111827" }}>Даалгавар илгээх</h3>
-              <button onClick={() => setSubmitTarget(null)} style={{ background: "none", border: "none", cursor: "pointer" }}>
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="#9ca3af"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
-              </button>
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50 }}>
+          <div style={{ background: "white", borderRadius: 16, padding: 24, width: 420, maxWidth: "90vw" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+              <h3 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: "#111827" }}>Даалгавар илгээх</h3>
+              <button onClick={() => setSubmitTarget(null)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 20, color: "#9ca3af" }}>×</button>
             </div>
-            <p style={{ margin: "0 0 20px", fontSize: 13, color: "#9ca3af" }}>{submitTarget.title}</p>
-            <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-              <div>
-                <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#374151", marginBottom: 6 }}>Тайлбар (сонголтой)</label>
-                <textarea placeholder="Ажлын тайлбар бичнэ үү..." rows={3} value={submitText}
-                  onChange={e => setSubmitText(e.target.value)}
-                  style={{ width: "100%", padding: "10px 14px", borderRadius: 12, border: "1px solid #e5e7eb", fontSize: 13, outline: "none", resize: "none", color: "#111827", background: "#f9fafb", boxSizing: "border-box" }} />
-              </div>
-              <div>
-                <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: "#374151", marginBottom: 6 }}>Зураг / файл хавсаргах</label>
-                <div style={{ border: `2px dashed ${submitFile ? "#06b6d4" : "#e5e7eb"}`, borderRadius: 12, padding: 20, textAlign: "center", cursor: "pointer", background: submitFile ? "#e0f7fa" : "white" }}
-                  onClick={() => fileInputRef.current?.click()}>
-                  {submitFile ? (
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 12 }}>
-                      {submitFile.type.startsWith("image/") ? (
-                        <img src={URL.createObjectURL(submitFile)} alt="" style={{ height: 72, borderRadius: 8, objectFit: "contain" }}
-                          onLoad={e => URL.revokeObjectURL(e.target.src)} />
-                      ) : (
-                        <svg width="24" height="24" viewBox="0 0 24 24" fill="#06b6d4"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6z"/></svg>
-                      )}
-                      <div style={{ textAlign: "left" }}>
-                        <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: "#111827" }}>{submitFile.name}</p>
-                        <button type="button" onClick={e => { e.stopPropagation(); setSubmitFile(null); }}
-                          style={{ background: "none", border: "none", cursor: "pointer", fontSize: 12, color: "#ef4444", padding: 0, marginTop: 2 }}>Устгах</button>
-                      </div>
-                    </div>
-                  ) : (
-                    <>
-                      <svg style={{ display: "block", margin: "0 auto 8px" }} width="28" height="28" viewBox="0 0 24 24" fill="#9ca3af"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
-                      <p style={{ margin: 0, fontSize: 13, color: "#9ca3af" }}>Зураг, файл хавсаргах</p>
-                      <p style={{ margin: "4px 0 0", fontSize: 12, color: "#d1d5db" }}>Товшиж файл сонгох</p>
-                    </>
-                  )}
-                </div>
-                <input ref={fileInputRef} type="file" accept="image/*,.pdf,.doc,.docx" style={{ display: "none" }}
-                  onChange={e => setSubmitFile(e.target.files?.[0] || null)} />
-              </div>
-              {submitError && <p style={{ margin: 0, fontSize: 13, color: "#ef4444" }}>{submitError}</p>}
-              <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
-                <button type="submit" disabled={submitting}
-                  style={{ flex: 1, padding: "12px 0", borderRadius: 12, fontWeight: 700, color: "white", background: "#06b6d4", border: "none", cursor: "pointer", fontSize: 14, opacity: submitting ? 0.6 : 1 }}>
-                  {submitting ? "Илгээж байна..." : "Илгээх"}
-                </button>
-                <button type="button" onClick={() => setSubmitTarget(null)}
-                  style={{ padding: "12px 20px", borderRadius: 12, fontWeight: 600, fontSize: 14, color: "#6b7280", background: "white", border: "1px solid #e5e7eb", cursor: "pointer" }}>
-                  Болих
+            <p style={{ margin: "0 0 16px", fontSize: 14, color: "#6b7280" }}>{submitTarget.title}</p>
+            <form onSubmit={handleSubmit}>
+              <textarea
+                value={submitText}
+                onChange={e => setSubmitText(e.target.value)}
+                placeholder="Тайлбар бичих..."
+                rows={4}
+                style={{ width: "100%", padding: 12, borderRadius: 10, border: "1px solid #e5e7eb", fontSize: 14, resize: "vertical", marginBottom: 12 }}
+              />
+              <div style={{ marginBottom: 16 }}>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={e => setSubmitFile(e.target.files?.[0] || null)}
+                  style={{ display: "none" }}
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  style={{ padding: "10px 16px", borderRadius: 8, border: "1px dashed #d1d5db", background: "transparent", cursor: "pointer", fontSize: 13, color: "#6b7280", width: "100%" }}>
+                  {submitFile ? submitFile.name : "Зураг хавсаргах (заавал биш)"}
                 </button>
               </div>
+              {submitError && <p style={{ color: "#ef4444", fontSize: 13, marginBottom: 12 }}>{submitError}</p>}
+              <button
+                type="submit"
+                disabled={submitting}
+                style={{
+                  width: "100%", padding: "12px", borderRadius: 10, border: "none", cursor: "pointer",
+                  background: submitting ? "#d1d5db" : "#06b6d4", color: "white", fontWeight: 700, fontSize: 14,
+                }}>
+                {submitting ? "Илгээж байна..." : "Илгээх"}
+              </button>
             </form>
           </div>
         </div>
